@@ -8,7 +8,13 @@ import uuid
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.result_cache import ResultCacheService
 from app.store import store
+
+
+# 联邦查询缓存摘要与 result_cache 写入时保持一致
+def _fingerprint(plan_id: int) -> str:
+    return f"federated_query_plan_{plan_id}"
 
 
 class QueryFederationService(BaseModuleService):
@@ -46,7 +52,12 @@ class QueryFederationService(BaseModuleService):
         return plan
 
     def execute_federation_query(self, plan_id: int) -> dict[str, Any]:
-        """执行联邦查询：读取 source_registry 和 query_rewrite，写入 result_cache 和 query_audit。"""
+        """执行联邦查询：优先读取可复核缓存，未命中才回源。
+
+        命中时交付缓存批次并把命中结果回写查询审计清单（保留批次来源与
+        有效期证据）；未命中时回源执行，写入新缓存批次与回源执行审计。
+        回源时源数据已经更正，审计关联的是本次新的执行而非旧批命中。
+        """
         plan = store.find(self.MODULE, plan_id)
         if plan is None:
             return {"ok": False, "message": "查询计划不存在"}
@@ -69,20 +80,49 @@ class QueryFederationService(BaseModuleService):
                 "message": f"部分数据源不可用: {', '.join(missing)}",
             }
 
+        fingerprint = _fingerprint(plan_id)
+
+        # 1. 先读取可复核的缓存命中数据，据此决定是否回源
+        verdict = ResultCacheService().read_verifiable_cache(fingerprint, record_hit=True)
+        if verdict["hit"]:
+            delivery = verdict["delivery"]
+            # 实际命中结果回写查询审计清单，保留所用批次来源
+            audit = _audit_cache_hit(plan_id, delivery, verdict["candidates"])
+            plan["status"] = "已完成"
+            plan["pending"] = False
+            return {
+                "ok": True,
+                "plan_id": plan_id,
+                "sources": len(valid_sources),
+                "cache_hit": True,
+                "cache_key": fingerprint,
+                "cache_id": delivery["cache_id"],
+                "批次标识": delivery.get("批次标识"),
+                "rows_returned": delivery["row_count"],
+                "results": delivery["data"][:10],
+                "validity_evidence": delivery["validity_evidence"],
+                "audit_id": audit["id"],
+                "miss_reason": None,
+            }
+
+        # 2. 缓存不可用（缺席/超时/损坏/空结果），回源执行
         # 应用查询改写规则
         rewrite_rules = _get_applicable_rewrite_rules(plan)
-        rewritten_query = _apply_rewrite(plan, rewrite_rules)
+        _apply_rewrite(plan, rewrite_rules)
 
         # 执行查询（模拟）
         t0 = time.time()
         result_rows = _simulate_federated_query(sources, plan.get("谓词下推策略", ""))
 
-        # 写入结果缓存
-        _cache_query_result(plan_id, result_rows)
+        # 写入结果缓存（新批次，留存到期凭据与结果摘要）
+        cache_entry = _cache_query_result(plan_id, result_rows)
 
-        # 写入查询审计
+        # 写入查询审计：回源执行，与旧批命中明确区分
         elapsed_ms = (time.time() - t0) * 1000
-        _audit_federated_query(plan_id, elapsed_ms, len(result_rows))
+        audit = _audit_federated_query(
+            plan_id, elapsed_ms, len(result_rows),
+            miss_reason=verdict["reason"], new_cache_id=cache_entry["id"],
+        )
 
         # 更新多维立方数据（如果涉及）
         _update_cube_if_needed(plan_id, result_rows)
@@ -95,10 +135,16 @@ class QueryFederationService(BaseModuleService):
             "ok": True,
             "plan_id": plan_id,
             "sources": len(valid_sources),
+            "cache_hit": False,
+            "miss_reason": verdict["reason"],
+            "cache_verification": verdict["candidates"],
             "rows_returned": len(result_rows),
             "elapsed_ms": elapsed_ms,
             "results": result_rows[:10],
-            "cache_key": _cache_key(plan_id),
+            "cache_key": fingerprint,
+            "cache_id": cache_entry["id"],
+            "批次标识": cache_entry.get("批次标识"),
+            "audit_id": audit["id"],
         }
 
     def estimate_query_cost(self, sources: list[str], query_type: str) -> dict[str, Any]:
@@ -213,17 +259,23 @@ def _simulate_federated_query(sources: list[str], strategy: str) -> list[dict[st
     return rows
 
 
-def _cache_query_result(plan_id: int, results: list[dict[str, Any]]) -> None:
+def _cache_query_result(plan_id: int, results: list[dict[str, Any]]) -> dict[str, Any]:
+    """回源后写入新的缓存批次，固化到期时刻与结果摘要作为同批凭据。"""
     rows = store.rows("result_cache")
     cache_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
     data_str = str(results)
+    result_hash = hashlib.md5(data_str.encode()).hexdigest()[:12]
+    batch_no = f"RESU-F{plan_id:04d}-B{cache_id}"
+    expire_ts = time.time() + 3600
     cache = {
         "id": cache_id,
         "条目编号": f"RESU-F{plan_id:04d}",
-        "查询摘要": f"federated_query_plan_{plan_id}",
-        "结果哈希": hashlib.md5(data_str.encode()).hexdigest()[:12],
-        "缓存命中": str(len(results)),
-        "过期时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 3600)),
+        "批次标识": batch_no,
+        "查询摘要": _fingerprint(plan_id),
+        "结果哈希": result_hash,
+        # 命中次数初始为 0，只有实际交付命中时才递增
+        "缓存命中": "0",
+        "过期时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expire_ts)),
         "存储大小": str(len(data_str)),
         "创建时间": time.strftime("%Y-%m-%d %H:%M:%S"),
         "最后命中": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -231,17 +283,65 @@ def _cache_query_result(plan_id: int, results: list[dict[str, Any]]) -> None:
         "pending": True,
         "abnormal": False,
         "result_data": results,
+        # 同批写入留存的到期时刻与结果摘要：到期列损坏时仍可凭此核验
+        "batch_evidence": {
+            "batch_no": batch_no,
+            "expire_ts": expire_ts,
+            "result_hash": result_hash,
+            "written_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        },
     }
     rows.append(cache)
+    return cache
 
 
-def _audit_federated_query(plan_id: int, elapsed_ms: float, result_count: int) -> None:
+def _audit_cache_hit(
+    plan_id: int, delivery: dict[str, Any], candidates: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """实际命中回写查询审计清单，保留所用批次来源与有效期证据。"""
+    rows = store.rows("query_audit")
+    audit_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+    evidence = delivery.get("validity_evidence", {})
+    audit = {
+        "id": audit_id,
+        "记录编号": f"AUDIT-{uuid.uuid4().hex[:8]}",
+        "查询语句": f"FEDERATED_CACHE_HIT plan_id={plan_id} cache_id={delivery['cache_id']}",
+        "执行耗时": "0ms",
+        "扫描行数": "0",
+        "返回行数": str(delivery.get("row_count", len(delivery.get("data", [])))),
+        "数据来源": "result_cache",
+        "操作用户": "federation_engine",
+        "查询时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "缓存命中",
+        "pending": False,
+        "abnormal": False,
+        # 保留所用的批次来源与核验证据，可复核
+        "批次标识": delivery.get("批次标识"),
+        "cache_id": delivery["cache_id"],
+        "validity_evidence": evidence,
+        "candidate_verdicts": [
+            {"cache_id": c.get("cache_id"), "verdict": c.get("verdict"), "reason": c.get("reason")}
+            for c in candidates
+        ],
+    }
+    rows.append(audit)
+    return audit
+
+
+def _audit_federated_query(
+    plan_id: int,
+    elapsed_ms: float,
+    result_count: int,
+    miss_reason: str | None = None,
+    new_cache_id: int | None = None,
+) -> dict[str, Any]:
+    """回源执行审计，与旧批缓存命中明确区分，记录未命中原因与新批次。"""
     rows = store.rows("query_audit")
     audit_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
     audit = {
         "id": audit_id,
         "记录编号": f"AUDIT-{uuid.uuid4().hex[:8]}",
-        "查询语句": f"FEDERATED_QUERY plan_id={plan_id}",
+        "查询语句": f"FEDERATED_QUERY plan_id={plan_id} miss_reason={miss_reason}",
         "执行耗时": f"{elapsed_ms:.0f}ms",
         "扫描行数": str(result_count * 3),
         "返回行数": str(result_count),
@@ -251,8 +351,13 @@ def _audit_federated_query(plan_id: int, elapsed_ms: float, result_count: int) -
         "status": "正常" if elapsed_ms < 5000 else "慢查询",
         "pending": False,
         "abnormal": elapsed_ms > 30000,
+        # 回源关联的是本次新执行与新写入批次，不是旧批命中
+        "cache_hit": False,
+        "miss_reason": miss_reason,
+        "new_cache_id": new_cache_id,
     }
     rows.append(audit)
+    return audit
 
 
 def _update_cube_if_needed(plan_id: int, results: list[dict[str, Any]]) -> None:
@@ -271,4 +376,5 @@ def _update_cube_if_needed(plan_id: int, results: list[dict[str, Any]]) -> None:
 
 
 def _cache_key(plan_id: int) -> str:
-    return f"federated_query/plan_{plan_id}/{uuid.uuid4().hex[:8]}"
+    """稳定缓存键：与 result_cache 中写入的查询摘要一致，便于审计复核。"""
+    return _fingerprint(plan_id)
